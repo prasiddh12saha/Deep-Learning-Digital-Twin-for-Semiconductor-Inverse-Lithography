@@ -1,9 +1,9 @@
 """
 MASTER PIPELINE: Neural Digital Twin for Semiconductor Inverse Lithography
-Orchestrates Modules 1 through 6:
-Data Generation -> Optics -> Resist -> Etch -> Differentiable ILT -> Metrology
+Loads calibrated physics checkpoints, runs ILT synthesis, and audits yield.
 """
 
+import os
 import sys
 import torch
 import numpy as np
@@ -25,31 +25,42 @@ def run_full_digital_twin():
     print(f"[*] Compute Device: {device}")
 
     # 1. Module 1: Data Engine
-    print("\n[Stage 1/5] Module 1 (Data): Generating synthetic Manhattan IC targets...")
-    loader = get_layout_dataloader(num_samples=16, batch_size=1, resolution=128, shuffle=False)
+    print("\n[Stage 1/5] Module 1 (Data): Generating synthetic Manhattan IC target...")
+    loader = get_layout_dataloader(num_samples=8, batch_size=1, resolution=128, shuffle=False)
     target_mask = next(iter(loader)).to(device)
-    print(f"    Target tensor generated with shape: {target_mask.shape}")
+    print(f"    Target tensor shape: {target_mask.shape} | Active pixels: {int(target_mask.sum().item())}")
 
-    # 2. Modules 2, 3, 4: Forward Surrogate Chain
-    print("\n[Stage 2/5] Initializing Neural Surrogates (Optics, Resist, Etch)...")
-    optics = NeuralOpticsEngine().to(device).eval()
-    resist = ResistUNet().to(device).eval()
-    etch = NeuralEtchEngine().to(device).eval()
-    print("    Forward physics models loaded and frozen.")
+    # 2. Modules 2, 3, 4: Load Calibrated Models
+    print("\n[Stage 2/5] Loading Calibrated Physics Surrogates...")
+    optics = NeuralOpticsEngine().to(device)
+    resist = ResistUNet().to(device)
+    etch = NeuralEtchEngine().to(device)
 
-    # 3. Uncorrected Baseline Forward Pass
+    if os.path.exists("checkpoints/optics.pt"):
+        optics.load_state_dict(torch.load("checkpoints/optics.pt", map_location=device))
+        resist.load_state_dict(torch.load("checkpoints/resist.pt", map_location=device))
+        etch.load_state_dict(torch.load("checkpoints/etch.pt", map_location=device))
+        print("    Loaded calibrated weights from checkpoints/")
+    else:
+        print("    [!] Checkpoints not found, using initialized weights.")
+
+    optics.eval()
+    resist.eval()
+    etch.eval()
+
+    # 3. Uncorrected Forward Simulation
     with torch.no_grad():
         baseline_aerial = optics(target_mask)
         baseline_resist = resist(baseline_aerial)
         baseline_silicon = etch(baseline_resist)
 
-    # 4. Module 5: Differentiable ILT Optimization
+    # 4. Module 5: Differentiable ILT
     print("\n[Stage 3/5] Module 5 (ILT): Running gradient-based mask synthesis...")
     optimizer = DifferentiableILTOptimizer(optics, resist, etch, device)
-    results = optimizer.optimize(target_mask, iterations=80, lr=0.08)
-    print(f"    Optimization complete. Final loss: {results['loss_history'][-1]:.6f}")
+    results = optimizer.optimize(target_mask, iterations=100, lr=0.08)
+    print(f"    Optimization complete. Initial loss: {results['loss_history'][0]:.5f} -> Final: {results['loss_history'][-1]:.5f}")
 
-    # 5. Module 6: Computational Metrology
+    # 5. Module 6: Metrology Audit
     print("\n[Stage 4/5] Module 6 (Metrology): Computing Edge Placement Errors (EPE)...")
     target_np = target_mask[0, 0].cpu().numpy()
     baseline_np = baseline_silicon[0, 0].cpu().numpy()
@@ -63,8 +74,11 @@ def run_full_digital_twin():
     print(f"  Uncorrected Mask   -> Mean EPE: {unopt_metrics['mean_epe_pixels']:.4f} px | Bridging: {unopt_metrics['bridging_count']} | Pinching: {unopt_metrics['pinching_count']}")
     print(f"  ILT Optimized Mask  -> Mean EPE: {opt_metrics['mean_epe_pixels']:.4f} px | Bridging: {opt_metrics['bridging_count']} | Pinching: {opt_metrics['pinching_count']}")
     
-    improvement = ((unopt_metrics['mean_epe_pixels'] - opt_metrics['mean_epe_pixels']) / (unopt_metrics['mean_epe_pixels'] + 1e-6)) * 100
-    print(f"  Yield Improvement  -> EPE Reduced by: {improvement:.2f}%")
+    if unopt_metrics['mean_epe_pixels'] > 0:
+        improvement = ((unopt_metrics['mean_epe_pixels'] - opt_metrics['mean_epe_pixels']) / unopt_metrics['mean_epe_pixels']) * 100
+        print(f"  Yield Improvement  -> EPE Reduced by: {improvement:.2f}%")
+    else:
+        print("  Yield Improvement  -> Direct contour match.")
     print("-" * 97)
     print("\n[Stage 5/5] Digital Twin pipeline finished successfully.\n")
 
